@@ -15,12 +15,11 @@
 
 'use strict';
 
-const express    = require('express');
-const cors       = require('cors');
-const fetch      = require('node-fetch');
-const nodemailer = require('nodemailer');
-const jwt        = require('jsonwebtoken');
-const mongoose   = require('mongoose');
+const express  = require('express');
+const cors     = require('cors');
+const fetch    = require('node-fetch');
+const jwt      = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -61,14 +60,34 @@ const USERS = [
 const otpStore = new Map();
 const OTP_TTL_MS = 10 * 60 * 1000;
 
-// ── 5. EMAIL TRANSPORTER ──────────────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+// ── 5. EMAIL SENDER (Resend — HTTPS API, no SMTP ports needed) ───────────────
+async function sendOtpEmail(to, otp) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method:  'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify({
+      from:    'TicketEx Auth <onboarding@resend.dev>',
+      to:      [to],
+      subject: 'Your TicketEx Login OTP',
+      html: `
+        <div style="font-family:sans-serif;max-width:400px;margin:0 auto">
+          <h2 style="color:#00d4ff">TicketEx Login</h2>
+          <p>Your one-time password is:</p>
+          <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00d4ff;padding:20px 0">${otp}</div>
+          <p style="color:#999;font-size:13px">Expires in 10 minutes. Do not share it.</p>
+        </div>
+      `,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.message || `Resend error ${res.status}`);
+  }
+}
 
 // ── 6. CORS ───────────────────────────────────────────────────────────────────
 const PROD_ORIGINS = (process.env.FRONTEND_URL || '')
@@ -158,20 +177,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
   otpStore.set(email, { otp, expiresAt });
 
   try {
-    await transporter.sendMail({
-      from:    `"TicketEx Auth" <${process.env.EMAIL_USER}>`,
-      to:      email,
-      subject: 'Your TicketEx Login OTP',
-      html: `
-        <div style="font-family:sans-serif;max-width:400px;margin:0 auto">
-          <h2 style="color:#00d4ff">TicketEx Login</h2>
-          <p>Your one-time password is:</p>
-          <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00d4ff;padding:20px 0">${otp}</div>
-          <p style="color:#999;font-size:13px">This OTP expires in 10 minutes. Do not share it with anyone.</p>
-        </div>
-      `,
-    });
-
+    await sendOtpEmail(email, otp);
     console.log(`[otp] Sent OTP to ${email}`);
     res.json({ message: 'If that email is registered, an OTP has been sent.' });
 
