@@ -61,7 +61,16 @@ const otpStore = new Map();
 const OTP_TTL_MS = 10 * 60 * 1000;
 
 // ── 5. EMAIL SENDER (Resend — HTTPS API, no SMTP ports needed) ───────────────
-async function sendOtpEmail(to, otp) {
+// Resend free tier can only deliver to the verified owner email (ADMIN_EMAIL).
+// For employee logins the OTP is sent to the admin inbox with a clear label —
+// the admin then shares it with the employee verbally / via chat.
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'vishalratnakar453@gmail.com';
+
+async function sendOtpEmail(recipientEmail, otp, role) {
+  const isAdmin    = role === 'admin';
+  const deliverTo  = isAdmin ? recipientEmail : ADMIN_EMAIL;
+  const subjectTag = isAdmin ? '' : ` [for ${recipientEmail}]`;
+
   const res = await fetch('https://api.resend.com/emails', {
     method:  'POST',
     headers: {
@@ -70,14 +79,18 @@ async function sendOtpEmail(to, otp) {
     },
     body: JSON.stringify({
       from:    'TicketEx Auth <onboarding@resend.dev>',
-      to:      [to],
-      subject: 'Your TicketEx Login OTP',
+      to:      [deliverTo],
+      subject: `Your TicketEx Login OTP${subjectTag}`,
       html: `
-        <div style="font-family:sans-serif;max-width:400px;margin:0 auto">
+        <div style="font-family:sans-serif;max-width:420px;margin:0 auto">
           <h2 style="color:#00d4ff">TicketEx Login</h2>
-          <p>Your one-time password is:</p>
+          ${!isAdmin ? `<p style="background:#fffbe6;border:1px solid #ffe58f;border-radius:6px;padding:10px 14px;font-size:13px">
+            <strong>Admin notice:</strong> This OTP was requested by <strong>${recipientEmail}</strong>.
+            Please share it with them.
+          </p>` : ''}
+          <p>One-time password${!isAdmin ? ` for <strong>${recipientEmail}</strong>` : ''}:</p>
           <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00d4ff;padding:20px 0">${otp}</div>
-          <p style="color:#999;font-size:13px">Expires in 10 minutes. Do not share it.</p>
+          <p style="color:#999;font-size:13px">Expires in 10 minutes. Do not share it with anyone else.</p>
         </div>
       `,
     }),
@@ -177,8 +190,8 @@ app.post('/api/auth/send-otp', async (req, res) => {
   otpStore.set(email, { otp, expiresAt });
 
   try {
-    await sendOtpEmail(email, otp);
-    console.log(`[otp] Sent OTP to ${email}`);
+    await sendOtpEmail(email, otp, user.role);
+    console.log(`[otp] Sent OTP for ${email} (${user.role}) → delivered to ${user.role === 'admin' ? email : ADMIN_EMAIL}`);
     res.json({ message: 'If that email is registered, an OTP has been sent.' });
 
   } catch (err) {
