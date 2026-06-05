@@ -1,28 +1,76 @@
 // =============================================================================
-// TicketEx Proxy Server
+// TicketEx Proxy + Auth Server
 // Deploy on Render (Free tier or above).
 //
 // Required environment variables (set in Render dashboard → Environment):
 //   CSV_SOURCE_URL  — the third-party CSV URL that is CORS-blocked in browsers
 //   FRONTEND_URL    — your Vercel URL(s), comma-separated
-//                     e.g. https://ticketex.vercel.app,http://127.0.0.1:5500
+//   JWT_SECRET      — long random string for signing tokens
+//   EMAIL_USER      — Gmail address used to send OTPs
+//   EMAIL_PASS      — Gmail App Password (not your account password)
+//   MONGODB_URI     — MongoDB Atlas connection string
 //
 // Render automatically injects PORT — do not set it manually.
 // =============================================================================
 
 'use strict';
 
-const express   = require('express');
-const cors      = require('cors');
-const fetch     = require('node-fetch'); // node-fetch v2 — CommonJS compatible
+const express    = require('express');
+const cors       = require('cors');
+const fetch      = require('node-fetch');
+const nodemailer = require('nodemailer');
+const jwt        = require('jsonwebtoken');
+const mongoose   = require('mongoose');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── 1. CORS ───────────────────────────────────────────────────────────────────
-// Build the allowed-origin list from FRONTEND_URL (comma-separated) plus a
-// hardcoded set of local-dev origins that are always permitted.
+// ── 1. MONGOOSE CONNECTION ────────────────────────────────────────────────────
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('[db] Connected to MongoDB'))
+  .catch(err => console.error('[db] Connection error:', err.message));
 
+// ── 2. SCHEMA & MODEL ─────────────────────────────────────────────────────────
+const loginLogSchema = new mongoose.Schema({
+  email:     { type: String, required: true },
+  role:      { type: String, required: true },
+  timestamp: { type: Date,   default: Date.now },
+});
+
+const LoginLog = mongoose.model('LoginLog', loginLogSchema);
+
+// ── 3. USERS ALLOWLIST ────────────────────────────────────────────────────────
+// Only emails listed here may request an OTP.
+// const USERS = [
+//   { email: 'vishalratnakar453@gmail.com', role: 'admin' },
+//   // Add more users here: { email: 'worker@company.com', role: 'employee' }
+// ];
+
+const USERS = [
+  { email: 'vishalratnakar453@gmail.com', role: 'admin' },
+  { email: 'vishal.ratnakar@ticketex.co',          role: 'employee' },
+  { email: 'yogesh.parashar@ticketex.co',          role: 'employee' },
+];
+
+// ── 4. IN-MEMORY OTP STORE ────────────────────────────────────────────────────
+// OTPs are single-use and expire after 10 minutes.
+// Map<email, { otp: string, expiresAt: number }>
+
+
+
+const otpStore = new Map();
+const OTP_TTL_MS = 10 * 60 * 1000;
+
+// ── 5. EMAIL TRANSPORTER ──────────────────────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+// ── 6. CORS ───────────────────────────────────────────────────────────────────
 const PROD_ORIGINS = (process.env.FRONTEND_URL || '')
   .split(',')
   .map(o => o.trim())
@@ -41,63 +89,160 @@ const ALLOWED_ORIGINS = [...new Set([...PROD_ORIGINS, ...DEV_ORIGINS])];
 
 app.use(cors({
   origin(incomingOrigin, callback) {
-    // Requests with no Origin header (curl, Postman, server-to-server) are OK
     if (!incomingOrigin) return callback(null, true);
-
-    if (ALLOWED_ORIGINS.includes(incomingOrigin)) {
-      return callback(null, true);
-    }
-
+    if (ALLOWED_ORIGINS.includes(incomingOrigin)) return callback(null, true);
     console.warn(`[cors] rejected origin: ${incomingOrigin}`);
     callback(new Error(`CORS policy: origin "${incomingOrigin}" is not allowed.`));
   },
-  methods:              ['GET', 'OPTIONS'],
-  allowedHeaders:       ['Content-Type'],
+  methods:              ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders:       ['Content-Type', 'Authorization'],
   optionsSuccessStatus: 200,
 }));
 
-// ── 2. SECURITY HEADERS ───────────────────────────────────────────────────────
-// Minimal hardening for a public-facing proxy endpoint.
+// ── 7. SECURITY HEADERS & BODY PARSING ───────────────────────────────────────
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options',        'DENY');
   next();
 });
 
-// ── 3. HEALTH CHECK ───────────────────────────────────────────────────────────
-// Render's zero-downtime deploys ping this before routing traffic.
-// Also useful for uptime monitors (UptimeRobot, BetterUptime, etc.).
+app.use(express.json());
+
+// ── 8. AUTH MIDDLEWARE ────────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const token      = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  if (!token) return res.status(401).json({ error: 'Missing token.' });
+
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token.' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden: admin access only.' });
+  }
+  next();
+}
+
+// ── 9. HEALTH CHECK ───────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({
     status:    'ok',
     timestamp: new Date().toISOString(),
     uptime:    Math.floor(process.uptime()),
+    db:        mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
   });
 });
 
-// ── 4. PROXY ENDPOINT ─────────────────────────────────────────────────────────
-// GET /api/bookings
-//
-// Fetches the CSV from CSV_SOURCE_URL and returns it to the frontend.
-// Headers set on the response:
-//   Content-Type       — text/csv so the browser handles it correctly
-//   Cache-Control      — no-store so every Refresh click fetches fresh data
-//   X-Rows-Fetched     — byte size logged for observability
+// ── 10. AUTH — REQUEST OTP ─────────────────────────────────────────────────────
+// POST /api/auth/send-otp   body: { email }
+// Generates a 6-digit OTP, stores it in memory, and emails it to the user.
 
-const FETCH_TIMEOUT_MS = 15_000; // 15 seconds — plenty for any CSV
+app.post('/api/auth/send-otp', async (req, res) => {
+  const email = (req.body.email || '').toLowerCase().trim();
+
+  const user = USERS.find(u => u.email.toLowerCase() === email);
+  if (!user) {
+    // Return the same response for unknown emails to avoid user enumeration
+    return res.json({ message: 'If that email is registered, an OTP has been sent.' });
+  }
+
+  const otp       = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = Date.now() + OTP_TTL_MS;
+  otpStore.set(email, { otp, expiresAt });
+
+  try {
+    await transporter.sendMail({
+      from:    `"TicketEx Auth" <${process.env.EMAIL_USER}>`,
+      to:      email,
+      subject: 'Your TicketEx Login OTP',
+      html: `
+        <div style="font-family:sans-serif;max-width:400px;margin:0 auto">
+          <h2 style="color:#00d4ff">TicketEx Login</h2>
+          <p>Your one-time password is:</p>
+          <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00d4ff;padding:20px 0">${otp}</div>
+          <p style="color:#999;font-size:13px">This OTP expires in 10 minutes. Do not share it with anyone.</p>
+        </div>
+      `,
+    });
+
+    console.log(`[otp] Sent OTP to ${email}`);
+    res.json({ message: 'If that email is registered, an OTP has been sent.' });
+
+  } catch (err) {
+    console.error('[otp] Email send error:', err.message);
+    otpStore.delete(email);
+    res.status(500).json({ error: 'Failed to send OTP. Please try again.' });
+  }
+});
+
+// ── 11. AUTH — VERIFY OTP ─────────────────────────────────────────────────────
+// POST /api/auth/verify-otp   body: { email, otp }
+// Validates the OTP, issues a JWT, and logs the login to MongoDB.
+
+app.post('/api/auth/verify-otp', async (req, res) => {
+  const email = (req.body.email || '').toLowerCase().trim();
+  const otp   = (req.body.otp   || '').trim();
+
+  const user = USERS.find(u => u.email.toLowerCase() === email);
+  if (!user) return res.status(401).json({ error: 'Invalid credentials.' });
+
+  const record = otpStore.get(email);
+  if (!record)                          return res.status(401).json({ error: 'No OTP found. Please request a new one.' });
+  if (Date.now() > record.expiresAt)    { otpStore.delete(email); return res.status(401).json({ error: 'OTP has expired. Please request a new one.' }); }
+  if (record.otp !== otp)               return res.status(401).json({ error: 'Incorrect OTP.' });
+
+  otpStore.delete(email); // single-use
+
+  const token = jwt.sign(
+    { email: user.email, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: '8h' }
+  );
+
+  // Persist login event to MongoDB
+  try {
+    await LoginLog.create({ email: user.email, role: user.role });
+  } catch (dbErr) {
+    console.error('[db] Failed to save login log:', dbErr.message);
+    // Non-fatal — still issue the token
+  }
+
+  console.log(`[auth] Login success: ${email} (${user.role})`);
+  res.json({ token, role: user.role, email: user.email });
+});
+
+// ── 12. ADMIN — LOGIN HISTORY ─────────────────────────────────────────────────
+// GET /api/admin/history
+// Returns all login logs, newest first. Requires valid JWT with role === 'admin'.
+
+app.get('/api/admin/history', requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const logs = await LoginLog.find().sort({ timestamp: -1 }).lean();
+    res.json(logs);
+  } catch (err) {
+    console.error('[admin] DB query error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve history.' });
+  }
+});
+
+// ── 13. CSV PROXY ─────────────────────────────────────────────────────────────
+const FETCH_TIMEOUT_MS = 15_000;
 
 app.get('/api/bookings', async (_req, res) => {
   const csvUrl = process.env.CSV_SOURCE_URL;
 
-  // Guard: env var must be set before the server is useful
   if (!csvUrl) {
     console.error('[proxy] CSV_SOURCE_URL is not set');
-    return res.status(500).json({
-      error: 'Server misconfiguration: CSV_SOURCE_URL environment variable is missing.',
-    });
+    return res.status(500).json({ error: 'Server misconfiguration: CSV_SOURCE_URL environment variable is missing.' });
   }
 
-  // Abort controller gives us a clean timeout on the upstream fetch
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -105,8 +250,7 @@ app.get('/api/bookings', async (_req, res) => {
     const upstream = await fetch(csvUrl, {
       signal:  controller.signal,
       headers: {
-        // Some origin servers reject requests without a User-Agent
-        'User-Agent': 'TicketEx-Proxy/1.0 (+https://github.com/your-repo)',
+        'User-Agent': 'TicketEx-Proxy/1.0',
         'Accept':     'text/csv, text/plain, */*',
       },
     });
@@ -115,58 +259,43 @@ app.get('/api/bookings', async (_req, res) => {
 
     if (!upstream.ok) {
       console.error(`[proxy] upstream ${upstream.status} for ${csvUrl}`);
-      return res.status(upstream.status).json({
-        error: `Upstream data source returned HTTP ${upstream.status} (${upstream.statusText}).`,
-      });
+      return res.status(upstream.status).json({ error: `Upstream returned HTTP ${upstream.status}.` });
     }
 
     const csvText = await upstream.text();
+    res.setHeader('Content-Type',  'text/csv; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('X-Rows-Fetched', csvText.split('\n').length - 1);
 
-    // Tell the browser / CDN never to cache this — each refresh must be live
-    res.setHeader('Content-Type',       'text/csv; charset=utf-8');
-    res.setHeader('Cache-Control',      'no-store, no-cache, must-revalidate');
-    res.setHeader('X-Rows-Fetched',     csvText.split('\n').length - 1); // approx row count
-
-    console.log(`[proxy] served ${csvText.length} bytes from upstream`);
+    console.log(`[proxy] served ${csvText.length} bytes`);
     res.send(csvText);
 
   } catch (err) {
     clearTimeout(timer);
-
-    if (err.name === 'AbortError') {
-      console.error(`[proxy] upstream timed out after ${FETCH_TIMEOUT_MS}ms`);
-      return res.status(504).json({ error: 'Upstream data source timed out.' });
-    }
-
+    if (err.name === 'AbortError') return res.status(504).json({ error: 'Upstream timed out.' });
     console.error('[proxy] fetch error:', err.message);
     res.status(502).json({ error: 'Failed to reach the upstream data source.' });
   }
 });
 
-// ── 5. 404 CATCH-ALL ──────────────────────────────────────────────────────────
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Not found.' });
-});
+// ── 14. 404 & ERROR HANDLERS ──────────────────────────────────────────────────
+app.use((_req, res) => res.status(404).json({ error: 'Not found.' }));
 
-// ── 6. GLOBAL ERROR HANDLER ───────────────────────────────────────────────────
-// Catches CORS errors and any other Express errors
 app.use((err, _req, res, _next) => {
   console.error('[error]', err.message);
   res.status(403).json({ error: err.message });
 });
 
-// ── 7. START + GRACEFUL SHUTDOWN ─────────────────────────────────────────────
-// Render sends SIGTERM before replacing the old instance — drain in-flight
-// requests cleanly instead of dropping them.
+// ── 15. START + GRACEFUL SHUTDOWN ─────────────────────────────────────────────
 const server = app.listen(PORT, () => {
-  console.log(`[startup] TicketEx proxy running on port ${PORT}`);
+  console.log(`[startup] TicketEx server running on port ${PORT}`);
   console.log(`[startup] Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
-  console.log(`[startup] CSV source configured: ${!!process.env.CSV_SOURCE_URL}`);
 });
 
 function shutdown(signal) {
-  console.log(`[shutdown] Received ${signal} — closing server`);
-  server.close(() => {
+  console.log(`[shutdown] ${signal} received — closing server`);
+  server.close(async () => {
+    await mongoose.connection.close();
     console.log('[shutdown] All connections closed. Exiting.');
     process.exit(0);
   });
