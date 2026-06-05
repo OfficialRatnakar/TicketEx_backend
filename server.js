@@ -60,37 +60,24 @@ const USERS = [
 const otpStore = new Map();
 const OTP_TTL_MS = 10 * 60 * 1000;
 
-// ── 5. EMAIL SENDER (Resend — HTTPS API, no SMTP ports needed) ───────────────
-// Resend free tier can only deliver to the verified owner email (ADMIN_EMAIL).
-// For employee logins the OTP is sent to the admin inbox with a clear label —
-// the admin then shares it with the employee verbally / via chat.
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'vishalratnakar453@gmail.com';
-
-async function sendOtpEmail(recipientEmail, otp, role) {
-  const isAdmin    = role === 'admin';
-  const deliverTo  = isAdmin ? recipientEmail : ADMIN_EMAIL;
-  const subjectTag = isAdmin ? '' : ` [for ${recipientEmail}]`;
-
-  const res = await fetch('https://api.resend.com/emails', {
+// ── 5. EMAIL SENDER (Brevo — HTTPS API, no SMTP ports, free tier 300/day) ────
+async function sendOtpEmail(to, otp) {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method:  'POST',
     headers: {
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-      'Content-Type':  'application/json',
+      'api-key':      process.env.BREVO_API_KEY,
+      'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from:    'TicketEx Auth <onboarding@resend.dev>',
-      to:      [deliverTo],
-      subject: `Your TicketEx Login OTP${subjectTag}`,
-      html: `
-        <div style="font-family:sans-serif;max-width:420px;margin:0 auto">
+      sender:     { name: 'TicketEx Auth', email: process.env.BREVO_SENDER_EMAIL },
+      to:         [{ email: to }],
+      subject:    'Your TicketEx Login OTP',
+      htmlContent: `
+        <div style="font-family:sans-serif;max-width:400px;margin:0 auto">
           <h2 style="color:#00d4ff">TicketEx Login</h2>
-          ${!isAdmin ? `<p style="background:#fffbe6;border:1px solid #ffe58f;border-radius:6px;padding:10px 14px;font-size:13px">
-            <strong>Admin notice:</strong> This OTP was requested by <strong>${recipientEmail}</strong>.
-            Please share it with them.
-          </p>` : ''}
-          <p>One-time password${!isAdmin ? ` for <strong>${recipientEmail}</strong>` : ''}:</p>
+          <p>Your one-time password is:</p>
           <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00d4ff;padding:20px 0">${otp}</div>
-          <p style="color:#999;font-size:13px">Expires in 10 minutes. Do not share it with anyone else.</p>
+          <p style="color:#999;font-size:13px">Expires in 10 minutes. Do not share it with anyone.</p>
         </div>
       `,
     }),
@@ -98,7 +85,7 @@ async function sendOtpEmail(recipientEmail, otp, role) {
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.message || `Resend error ${res.status}`);
+    throw new Error(body.message || `Brevo error ${res.status}`);
   }
 }
 
@@ -190,8 +177,8 @@ app.post('/api/auth/send-otp', async (req, res) => {
   otpStore.set(email, { otp, expiresAt });
 
   try {
-    await sendOtpEmail(email, otp, user.role);
-    console.log(`[otp] Sent OTP for ${email} (${user.role}) → delivered to ${user.role === 'admin' ? email : ADMIN_EMAIL}`);
+    await sendOtpEmail(email, otp);
+    console.log(`[otp] Sent OTP to ${email}`);
     res.json({ message: 'If that email is registered, an OTP has been sent.' });
 
   } catch (err) {
