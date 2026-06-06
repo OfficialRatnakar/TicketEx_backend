@@ -33,6 +33,12 @@ const LoginLog = mongoose.model('LoginLog', new mongoose.Schema({
   timestamp: { type: Date,   default: Date.now },
 }));
 
+// Generic key/value flags (e.g. the "corgi mode" dashboard easter egg).
+const Setting = mongoose.model('Setting', new mongoose.Schema({
+  key:   { type: String, required: true, unique: true },
+  value: { type: mongoose.Schema.Types.Mixed },
+}));
+
 // ── 2. USERS ──────────────────────────────────────────────────────────────────
 // Passwords are bcrypt hashes. Generate a new hash:
 //   node -e "require('bcryptjs').hash('yourpassword', 10).then(console.log)"
@@ -156,6 +162,35 @@ app.get('/api/admin/history', requireAuth, requireAdmin, async (_req, res) => {
   } catch (err) {
     console.error('[admin] DB query error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve history.' });
+  }
+});
+
+// ── 8b. SETTINGS (feature flags) ──────────────────────────────────────────────
+// Any logged-in user reads the current flags (the dashboard polls this).
+app.get('/api/settings', requireAuth, async (_req, res) => {
+  try {
+    const doc = await Setting.findOne({ key: 'corgiMode' }).lean();
+    res.json({ corgiMode: !!(doc && doc.value) });
+  } catch (err) {
+    console.error('[settings] read error:', err.message);
+    res.status(500).json({ error: 'Failed to read settings.' });
+  }
+});
+
+// Only admins flip the flags (the admin panel toggle posts here).
+app.post('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
+  const enabled = !!req.body.corgiMode;
+  try {
+    await Setting.findOneAndUpdate(
+      { key: 'corgiMode' },
+      { key: 'corgiMode', value: enabled },
+      { upsert: true, new: true }
+    );
+    console.log(`[settings] corgiMode set to ${enabled} by ${req.user.email}`);
+    res.json({ corgiMode: enabled });
+  } catch (err) {
+    console.error('[settings] write error:', err.message);
+    res.status(500).json({ error: 'Failed to update settings.' });
   }
 });
 
