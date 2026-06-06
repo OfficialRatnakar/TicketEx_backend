@@ -1,13 +1,10 @@
 // =============================================================================
 // TicketEx Proxy + Auth Server
-// Deploy on Render (Free tier or above).
 //
-// Required environment variables (set in Render dashboard → Environment):
-//   CSV_SOURCE_URL  — the third-party CSV URL that is CORS-blocked in browsers
-//   FRONTEND_URL    — your Vercel URL(s), comma-separated
+// Required environment variables (Render dashboard → Environment):
+//   CSV_SOURCE_URL  — CORS-blocked CSV URL
+//   FRONTEND_URL    — Vercel URL(s), comma-separated
 //   JWT_SECRET      — long random string for signing tokens
-//   EMAIL_USER      — Gmail address used to send OTPs
-//   EMAIL_PASS      — Gmail App Password (not your account password)
 //   MONGODB_URI     — MongoDB Atlas connection string
 //
 // Render automatically injects PORT — do not set it manually.
@@ -19,89 +16,54 @@ const express  = require('express');
 const cors     = require('cors');
 const fetch    = require('node-fetch');
 const jwt      = require('jsonwebtoken');
+const bcrypt   = require('bcryptjs');
 const mongoose = require('mongoose');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── 1. MONGOOSE CONNECTION ────────────────────────────────────────────────────
+// ── 1. MONGOOSE ───────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('[db] Connected to MongoDB'))
   .catch(err => console.error('[db] Connection error:', err.message));
 
-// ── 2. SCHEMA & MODEL ─────────────────────────────────────────────────────────
-const loginLogSchema = new mongoose.Schema({
+const LoginLog = mongoose.model('LoginLog', new mongoose.Schema({
   email:     { type: String, required: true },
   role:      { type: String, required: true },
   timestamp: { type: Date,   default: Date.now },
-});
+}));
 
-const LoginLog = mongoose.model('LoginLog', loginLogSchema);
-
-// ── 3. USERS ALLOWLIST ────────────────────────────────────────────────────────
-// Only emails listed here may request an OTP.
-// const USERS = [
-//   { email: 'vishalratnakar453@gmail.com', role: 'admin' },
-//   // Add more users here: { email: 'worker@company.com', role: 'employee' }
-// ];
-
+// ── 2. USERS ──────────────────────────────────────────────────────────────────
+// Passwords are bcrypt hashes. Generate a new hash:
+//   node -e "require('bcryptjs').hash('yourpassword', 10).then(console.log)"
+//
+// IMPORTANT: Run that command locally, paste the hash here, never store plain text.
 const USERS = [
-  { email: 'vishalratnakar453@gmail.com', role: 'admin' },
-  { email: 'vishal.ratnakar@ticketex.co',          role: 'employee' },
-  { email: 'yogesh.parashar@ticketex.co',          role: 'employee' },
+  {
+    email:    'vishalratnakar453@gmail.com',
+    role:     'admin',
+    passhash: process.env.ADMIN_PASS_HASH,   // set in Render environment
+  },
+  {
+    email:    'vishal.ratnakar@ticketex.co',
+    role:     'employee',
+    passhash: process.env.EMP1_PASS_HASH,
+  },
+  {
+    email:    'yogesh.parashar@ticketex.co',
+    role:     'employee',
+    passhash: process.env.EMP2_PASS_HASH,
+  },
 ];
 
-// ── 4. IN-MEMORY OTP STORE ────────────────────────────────────────────────────
-// OTPs are single-use and expire after 10 minutes.
-// Map<email, { otp: string, expiresAt: number }>
-
-
-
-const otpStore = new Map();
-const OTP_TTL_MS = 10 * 60 * 1000;
-
-// ── 5. EMAIL SENDER (Brevo — HTTPS API, no SMTP ports, free tier 300/day) ────
-async function sendOtpEmail(to, otp) {
-  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method:  'POST',
-    headers: {
-      'api-key':      process.env.BREVO_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      sender:     { name: 'TicketEx Auth', email: process.env.BREVO_SENDER_EMAIL },
-      to:         [{ email: to }],
-      subject:    'Your TicketEx Login OTP',
-      htmlContent: `
-        <div style="font-family:sans-serif;max-width:400px;margin:0 auto">
-          <h2 style="color:#00d4ff">TicketEx Login</h2>
-          <p>Your one-time password is:</p>
-          <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00d4ff;padding:20px 0">${otp}</div>
-          <p style="color:#999;font-size:13px">Expires in 10 minutes. Do not share it with anyone.</p>
-        </div>
-      `,
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.message || `Brevo error ${res.status}`);
-  }
-}
-
-// ── 6. CORS ───────────────────────────────────────────────────────────────────
+// ── 3. CORS ───────────────────────────────────────────────────────────────────
 const PROD_ORIGINS = (process.env.FRONTEND_URL || '')
-  .split(',')
-  .map(o => o.trim())
-  .filter(Boolean);
+  .split(',').map(o => o.trim()).filter(Boolean);
 
 const DEV_ORIGINS = [
-  'http://127.0.0.1:5500',
-  'http://localhost:5500',
-  'http://127.0.0.1:5501',
-  'http://localhost:5501',
-  'http://127.0.0.1:3000',
-  'http://localhost:3000',
+  'http://127.0.0.1:5500', 'http://localhost:5500',
+  'http://127.0.0.1:5501', 'http://localhost:5501',
+  'http://127.0.0.1:3000', 'http://localhost:3000',
 ];
 
 const ALLOWED_ORIGINS = [...new Set([...PROD_ORIGINS, ...DEV_ORIGINS])];
@@ -118,22 +80,19 @@ app.use(cors({
   optionsSuccessStatus: 200,
 }));
 
-// ── 7. SECURITY HEADERS & BODY PARSING ───────────────────────────────────────
+// ── 4. SECURITY HEADERS & BODY PARSING ───────────────────────────────────────
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options',        'DENY');
   next();
 });
-
 app.use(express.json());
 
-// ── 8. AUTH MIDDLEWARE ────────────────────────────────────────────────────────
+// ── 5. AUTH MIDDLEWARE ────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
-  const authHeader = req.headers['authorization'] || '';
-  const token      = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-
+  const header = req.headers['authorization'] || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Missing token.' });
-
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
@@ -143,13 +102,12 @@ function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') {
+  if (req.user?.role !== 'admin')
     return res.status(403).json({ error: 'Forbidden: admin access only.' });
-  }
   next();
 }
 
-// ── 9. HEALTH CHECK ───────────────────────────────────────────────────────────
+// ── 6. HEALTH CHECK ───────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({
     status:    'ok',
@@ -159,52 +117,25 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// ── 10. AUTH — REQUEST OTP ─────────────────────────────────────────────────────
-// POST /api/auth/send-otp   body: { email }
-// Generates a 6-digit OTP, stores it in memory, and emails it to the user.
+// ── 7. LOGIN ──────────────────────────────────────────────────────────────────
+// POST /api/auth/login   body: { email, password }
 
-app.post('/api/auth/send-otp', async (req, res) => {
-  const email = (req.body.email || '').toLowerCase().trim();
+app.post('/api/auth/login', async (req, res) => {
+  const email    = (req.body.email    || '').toLowerCase().trim();
+  const password = (req.body.password || '').trim();
 
-  const user = USERS.find(u => u.email.toLowerCase() === email);
-  if (!user) {
-    // Return the same response for unknown emails to avoid user enumeration
-    return res.json({ message: 'If that email is registered, an OTP has been sent.' });
-  }
-
-  const otp       = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + OTP_TTL_MS;
-  otpStore.set(email, { otp, expiresAt });
-
-  try {
-    await sendOtpEmail(email, otp);
-    console.log(`[otp] Sent OTP to ${email}`);
-    res.json({ message: 'If that email is registered, an OTP has been sent.' });
-
-  } catch (err) {
-    console.error('[otp] Email send error:', err.message);
-    otpStore.delete(email);
-    res.status(500).json({ error: 'Failed to send OTP. Please try again.' });
-  }
-});
-
-// ── 11. AUTH — VERIFY OTP ─────────────────────────────────────────────────────
-// POST /api/auth/verify-otp   body: { email, otp }
-// Validates the OTP, issues a JWT, and logs the login to MongoDB.
-
-app.post('/api/auth/verify-otp', async (req, res) => {
-  const email = (req.body.email || '').toLowerCase().trim();
-  const otp   = (req.body.otp   || '').trim();
+  if (!email || !password)
+    return res.status(400).json({ error: 'Email and password are required.' });
 
   const user = USERS.find(u => u.email.toLowerCase() === email);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials.' });
 
-  const record = otpStore.get(email);
-  if (!record)                          return res.status(401).json({ error: 'No OTP found. Please request a new one.' });
-  if (Date.now() > record.expiresAt)    { otpStore.delete(email); return res.status(401).json({ error: 'OTP has expired. Please request a new one.' }); }
-  if (record.otp !== otp)               return res.status(401).json({ error: 'Incorrect OTP.' });
+  // Always run bcrypt compare to prevent timing attacks
+  const dummyHash = '$2a$10$dummyhashfordummycomparison000000000000000000000000000';
+  const hash      = user?.passhash || dummyHash;
+  const match     = await bcrypt.compare(password, hash);
 
-  otpStore.delete(email); // single-use
+  if (!user || !match)
+    return res.status(401).json({ error: 'Incorrect email or password.' });
 
   const token = jwt.sign(
     { email: user.email, role: user.role },
@@ -212,22 +143,17 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     { expiresIn: '8h' }
   );
 
-  // Persist login event to MongoDB
   try {
     await LoginLog.create({ email: user.email, role: user.role });
   } catch (dbErr) {
     console.error('[db] Failed to save login log:', dbErr.message);
-    // Non-fatal — still issue the token
   }
 
-  console.log(`[auth] Login success: ${email} (${user.role})`);
+  console.log(`[auth] Login: ${email} (${user.role})`);
   res.json({ token, role: user.role, email: user.email });
 });
 
-// ── 12. ADMIN — LOGIN HISTORY ─────────────────────────────────────────────────
-// GET /api/admin/history
-// Returns all login logs, newest first. Requires valid JWT with role === 'admin'.
-
+// ── 8. ADMIN — LOGIN HISTORY ──────────────────────────────────────────────────
 app.get('/api/admin/history', requireAuth, requireAdmin, async (_req, res) => {
   try {
     const logs = await LoginLog.find().sort({ timestamp: -1 }).lean();
@@ -238,16 +164,12 @@ app.get('/api/admin/history', requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
-// ── 13. CSV PROXY ─────────────────────────────────────────────────────────────
+// ── 9. CSV PROXY ──────────────────────────────────────────────────────────────
 const FETCH_TIMEOUT_MS = 15_000;
 
 app.get('/api/bookings', async (_req, res) => {
   const csvUrl = process.env.CSV_SOURCE_URL;
-
-  if (!csvUrl) {
-    console.error('[proxy] CSV_SOURCE_URL is not set');
-    return res.status(500).json({ error: 'Server misconfiguration: CSV_SOURCE_URL environment variable is missing.' });
-  }
+  if (!csvUrl) return res.status(500).json({ error: 'CSV_SOURCE_URL is not set.' });
 
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -255,57 +177,44 @@ app.get('/api/bookings', async (_req, res) => {
   try {
     const upstream = await fetch(csvUrl, {
       signal:  controller.signal,
-      headers: {
-        'User-Agent': 'TicketEx-Proxy/1.0',
-        'Accept':     'text/csv, text/plain, */*',
-      },
+      headers: { 'User-Agent': 'TicketEx-Proxy/1.0', 'Accept': 'text/csv, */*' },
     });
-
     clearTimeout(timer);
 
-    if (!upstream.ok) {
-      console.error(`[proxy] upstream ${upstream.status} for ${csvUrl}`);
-      return res.status(upstream.status).json({ error: `Upstream returned HTTP ${upstream.status}.` });
-    }
+    if (!upstream.ok) return res.status(upstream.status).json({ error: `Upstream returned ${upstream.status}.` });
 
     const csvText = await upstream.text();
-    res.setHeader('Content-Type',  'text/csv; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Content-Type',   'text/csv; charset=utf-8');
+    res.setHeader('Cache-Control',  'no-store, no-cache, must-revalidate');
     res.setHeader('X-Rows-Fetched', csvText.split('\n').length - 1);
-
-    console.log(`[proxy] served ${csvText.length} bytes`);
     res.send(csvText);
 
   } catch (err) {
     clearTimeout(timer);
     if (err.name === 'AbortError') return res.status(504).json({ error: 'Upstream timed out.' });
-    console.error('[proxy] fetch error:', err.message);
     res.status(502).json({ error: 'Failed to reach the upstream data source.' });
   }
 });
 
-// ── 14. 404 & ERROR HANDLERS ──────────────────────────────────────────────────
+// ── 10. 404 & ERROR HANDLERS ──────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: 'Not found.' }));
-
 app.use((err, _req, res, _next) => {
   console.error('[error]', err.message);
   res.status(403).json({ error: err.message });
 });
 
-// ── 15. START + GRACEFUL SHUTDOWN ─────────────────────────────────────────────
+// ── 11. START + GRACEFUL SHUTDOWN ─────────────────────────────────────────────
 const server = app.listen(PORT, () => {
-  console.log(`[startup] TicketEx server running on port ${PORT}`);
+  console.log(`[startup] TicketEx server on port ${PORT}`);
   console.log(`[startup] Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
 });
 
 function shutdown(signal) {
-  console.log(`[shutdown] ${signal} received — closing server`);
+  console.log(`[shutdown] ${signal} — closing`);
   server.close(async () => {
     await mongoose.connection.close();
-    console.log('[shutdown] All connections closed. Exiting.');
     process.exit(0);
   });
 }
-
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
