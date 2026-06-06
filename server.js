@@ -45,11 +45,6 @@ const USERS = [
     passhash: process.env.ADMIN_PASS_HASH,   // set in Render environment
   },
   {
-    email:    'vishal.ratnakar@ticketex.co',
-    role:     'employee',
-    passhash: process.env.EMP1_PASS_HASH,
-  },
-  {
     email:    'yogesh.parashar@ticketex.co',
     role:     'employee',
     passhash: process.env.EMP2_PASS_HASH,
