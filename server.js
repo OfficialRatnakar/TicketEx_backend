@@ -55,6 +55,21 @@ const USERS = [
     role:     'employee',
     passhash: process.env.EMP1_PASS_HASH,
   },
+  {
+    email:    'cheshtha.rajpurohit@ticketex.co',
+    role:     'employee',
+    passhash: process.env.EMP3_PASS_HASH
+  },
+  {
+    email:    'Sudha.agarwal@ticketex.co',
+    role:     'employee',
+    passhash: process.env.EMP4_PASS_HASH
+  },
+  {
+    email:    'Amitkh@ticketex.co',
+    role:     'employee',
+    passhash: process.env.EMP4_PASS_HASH
+  },
 ];
 
 // ── 3. CORS ───────────────────────────────────────────────────────────────────
